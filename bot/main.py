@@ -11,6 +11,9 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+# Import our new extraction logic
+import extraction 
+
 # --- 1. CONFIGURATION & LOGGING ---
 LOG_FILE = "/app/logs/bot.log"
 DOWNLOAD_DIR = "/app/downloads"
@@ -22,22 +25,16 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("FinancialBot")
 
-# --- 2. DATABASE MANAGER (Connection Pool) ---
+# --- 2. DATABASE MANAGER ---
 try:
     db_pool = psycopg2.pool.ThreadedConnectionPool(
-        minconn=1,
-        maxconn=10,
-        host=os.environ["DB_HOST"],
-        database=os.environ["DB_NAME"],
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASS"]
+        minconn=1, maxconn=10,
+        host=os.environ["DB_HOST"], database=os.environ["DB_NAME"],
+        user=os.environ["DB_USER"], password=os.environ["DB_PASS"]
     )
 except Exception as e:
     logger.error(f"Fatal Error: Could not create DB pool: {e}")
@@ -58,33 +55,87 @@ def get_db_cursor():
     finally:
         db_pool.putconn(conn)
 
-def init_db():
-    """Create the table if it doesn't exist."""
-    # Retry logic for initial container startup
-    retries = 5
-    while retries > 0:
-        try:
-            with get_db_cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS messages (
-                        id SERIAL PRIMARY KEY,
-                        user_id TEXT,
-                        channel_id TEXT,
-                        text TEXT,
-                        file_path TEXT,
-                        timestamp TEXT,
-                        CONSTRAINT unique_msg UNIQUE (channel_id, timestamp)
-                    );
-                """)
-            logger.info("Database initialized successfully.")
-            return
-        except psycopg2.OperationalError:
-            logger.warning("DB not ready, retrying in 2s...")
-            time.sleep(2)
-            retries -= 1
-    logger.error("Could not initialize DB.")
+def migrate_db_schema():
+    """Safely adds columns if they don't exist by checking information_schema first."""
+    logger.info("Checking database schema...")
+    
+    # Define the columns you want to ensure exist
+    # format: "column_name": "data_type"
+    desired_columns = {
+        "transaction_date": "DATE",
+        "date_extracted": "BOOLEAN DEFAULT FALSE",
+        "amount": "NUMERIC(10, 2)",
+        "category": "TEXT",
+        "description": "TEXT",
+        "transcription": "TEXT",
+        "status": "TEXT DEFAULT 'new'"
+    }
 
-# --- 3. CORE LOGIC (Reusable Functions) ---
+    with get_db_cursor() as cur:
+        # 1. Get list of columns that ALREADY exist in the DB
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'messages';
+        """)
+        existing_columns = {row[0] for row in cur.fetchall()}
+
+        # 2. Loop through desired columns and add them ONLY if missing
+        for col_name, col_type in desired_columns.items():
+            if col_name not in existing_columns:
+                logger.info(f"Migrating: Adding missing column '{col_name}'...")
+                cur.execute(f"ALTER TABLE messages ADD COLUMN {col_name} {col_type};")
+            else:
+                logger.debug(f"Column '{col_name}' already exists. Skipping.")
+    
+    logger.info("Schema migration checks complete.")
+
+def backfill_data():
+    """
+    One-time adjustment: Finds rows where status is 'new' but amount/transaction_date is NULL,
+    and runs the extraction logic on them.
+    """
+    logger.info("Starting Backfill of existing data...")
+    try:
+        with get_db_cursor() as cur:
+            # Find messages that haven't been processed for data yet
+            cur.execute("""
+                SELECT id, text, timestamp 
+                FROM messages 
+                WHERE status = 'new' AND (amount IS NULL OR transaction_date IS NULL)
+            """)
+            rows = cur.fetchall()
+            
+            count = 0
+            for row in rows:
+                row_id, text, ts = row
+                
+                # Run Logic
+                data = extraction.extract_transaction_data(text, ts)
+                
+                # Update
+                cur.execute("""
+                    UPDATE messages 
+                    SET amount = %s,
+                        transaction_date = %s,
+                        date_extracted = %s,
+                        description = %s
+                    WHERE id = %s
+                """, (
+                    data['amount'], 
+                    data['transaction_date'], 
+                    data['date_extracted'], 
+                    data['description'], 
+                    row_id
+                ))
+                count += 1
+            
+            logger.info(f"Backfilled {count} rows with extracted data.")
+    except Exception as e:
+        logger.error(f"Backfill failed: {e}")
+
+# --- 3. CORE LOGIC ---
+
 def download_files(files_list, timestamp_prefix):
     """Downloads files and returns a semicolon-separated string of paths."""
     saved_paths = []
@@ -92,8 +143,7 @@ def download_files(files_list, timestamp_prefix):
 
     for f in files_list:
         url = f.get("url_private_download")
-        if not url:
-            continue
+        if not url: continue
 
         # Naming convention: TS_Filename
         file_name = f"{timestamp_prefix}_{f.get('name')}"
@@ -119,40 +169,77 @@ def download_files(files_list, timestamp_prefix):
 
 def process_and_save_message(channel_id, ts, user_id, text, files_list):
     """
-    The Single Source of Truth. 
-    Handles file downloads and DB Upserts for both Sync and Real-time.
+    Handles Upserts with Status Locking and Data Extraction.
     """
     try:
-        # 1. Handle Files
+        # 1. Check existing status
+        with get_db_cursor() as cur:
+            cur.execute("SELECT status FROM messages WHERE channel_id = %s AND timestamp = %s", (channel_id, ts))
+            res = cur.fetchone()
+            
+            if res:
+                current_status = res[0]
+                # LOCK: If status is not 'new', do not update
+                if current_status != 'new':
+                    logger.info(f"Skipping update for {ts}: Status is '{current_status}' (Immutable)")
+                    return
+
+        # 2. Extract Data
+        data = extraction.extract_transaction_data(text, ts)
         file_path_string = download_files(files_list, ts) if files_list else None
 
-        # 2. Database Upsert
+        # 3. Upsert
         with get_db_cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO messages (user_id, channel_id, text, file_path, timestamp) 
-                VALUES (%s, %s, %s, %s, %s) 
+                INSERT INTO messages (
+                    user_id, channel_id, text, file_path, timestamp, 
+                    amount, transaction_date, date_extracted, description, status
+                ) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'new') 
                 ON CONFLICT (channel_id, timestamp) 
-                DO UPDATE SET text = EXCLUDED.text, file_path = EXCLUDED.file_path
+                DO UPDATE SET 
+                    text = EXCLUDED.text, 
+                    file_path = EXCLUDED.file_path,
+                    amount = EXCLUDED.amount,
+                    transaction_date = EXCLUDED.transaction_date,
+                    date_extracted = EXCLUDED.date_extracted,
+                    description = EXCLUDED.description
+                -- Note: We don't update 'status' here, it stays what it was (or defaults to new on insert)
                 """,
-                (user_id, channel_id, text, file_path_string, ts)
+                (
+                    user_id, channel_id, text, file_path_string, ts,
+                    data['amount'], data['transaction_date'], data['date_extracted'], data['description']
+                )
             )
-        # No commit needed here; context manager handles it
+            
     except Exception as e:
         logger.error(f"Failed to save message {ts}: {e}")
 
 def delete_message_from_db(channel_id, ts):
     try:
         with get_db_cursor() as cur:
-            cur.execute(
-                "DELETE FROM messages WHERE channel_id = %s AND timestamp = %s",
-                (channel_id, ts)
-            )
-        logger.info(f"Deleted message {ts} from DB.")
+            # LOCK: Check status before deleting
+            cur.execute("SELECT status FROM messages WHERE channel_id = %s AND timestamp = %s", (channel_id, ts))
+            res = cur.fetchone()
+            
+            if res:
+                current_status = res[0]
+                if current_status != 'new':
+                    logger.warning(f"Blocked deletion for {ts}: Status is '{current_status}'")
+                    return
+                
+                # Proceed with delete
+                cur.execute(
+                    "DELETE FROM messages WHERE channel_id = %s AND timestamp = %s",
+                    (channel_id, ts)
+                )
+                logger.info(f"Deleted message {ts} from DB.")
+                
     except Exception as e:
         logger.error(f"Failed to delete message {ts}: {e}")
 
-# --- 4. STARTUP SYNC ---
+# --- 4. STARTUP SYNC (Simplified for brevity, uses process_and_save_message) ---
 def sync_missing_data():
     logger.info("--- Starting Startup Sync ---")
     client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
@@ -172,66 +259,17 @@ def sync_missing_data():
                 history = client.conversations_history(channel=cid, limit=50)
                 messages = history.get("messages", [])
                 
-                if not messages:
-                    continue
-
-                # 1. Collect valid timestamps from Slack
-                valid_slack_timestamps = set()
-
                 for msg in messages:
-                    subtype = msg.get("subtype")
-                    ts = msg.get("ts")
+                    if msg.get("subtype") in ["channel_join", "channel_leave", "channel_topic"]: continue
                     
-                    # Ignore system messages from the "Valid" list
-                    # But don't skip the loop yet, as we need to process them if valid
-                    if subtype in ["channel_join", "channel_leave", "channel_topic"]:
-                        continue
-                    
-                    valid_slack_timestamps.add(ts)
-                    
-                    # Extract Data & Upsert (Create/Update)
-                    user_id = msg.get("user")
-                    text = msg.get("text")
-                    files = msg.get("files", [])
-                    
-                    process_and_save_message(cid, ts, user_id, text, files)
+                    # process_and_save_message handles idempotency and regex extraction
+                    process_and_save_message(cid, msg.get("ts"), msg.get("user"), msg.get("text"), msg.get("files", []))
 
-                # --- CLEANUP LOGIC ---
-                # logic: Find messages in DB that are within the time window 
-                # of the batch we just fetched, but are NOT in the Slack list.
-                
-                oldest_fetched_ts = messages[-1]["ts"]
-
-                with get_db_cursor() as cur:
-                    # Get all DB timestamps for this channel since the oldest fetched message
-                    cur.execute(
-                        "SELECT timestamp FROM messages WHERE channel_id = %s AND timestamp >= %s",
-                        (cid, oldest_fetched_ts)
-                    )
-                    db_rows = cur.fetchall()
-                    
-                    # Convert DB results to a Set
-                    db_timestamps = {row[0] for row in db_rows}
-
-                    # Calculate the difference: Timestamps in DB but NOT in Slack
-                    deleted_timestamps = db_timestamps - valid_slack_timestamps
-
-                    if deleted_timestamps:
-                        logger.info(f"Sync Cleanup: Found {len(deleted_timestamps)} deleted messages in {channel['name']}")
-                        
-                        # Delete them
-                        for val_ts in deleted_timestamps:
-                            cur.execute(
-                                "DELETE FROM messages WHERE channel_id = %s AND timestamp = %s",
-                                (cid, val_ts)
-                            )
-
-            except SlackApiError as e:
-                logger.error(f"Cannot sync channel {cid}: {e}")
-
+            except SlackApiError:
+                continue
     except Exception as e:
         logger.error(f"Sync failed: {e}")
-
+    
     logger.info("--- Startup Sync Complete ---")
 
 # --- 5. REAL-TIME EVENT LISTENER ---
@@ -246,25 +284,15 @@ def handle_message_events(body):
     channel_id = event.get("channel")
     ts = event.get("ts")
 
-    # 1. Ignore Noise
-    if subtype in ["channel_join", "channel_leave", "channel_topic", "channel_purpose"]:
-        logger.debug(f"Ignoring noise subtype: {subtype}")
-        return
+    if subtype in ["channel_join", "channel_leave", "channel_topic"]: return
 
     # 2. Handle Deletion
     if subtype == "message_deleted":
-        logger.debug("Processing DELETION event")
-        deleted_ts = event.get("deleted_ts")
-        if not deleted_ts:
-            deleted_ts = event.get("previous_message", {}).get("ts")
-        
-        if deleted_ts:
-            delete_message_from_db(channel_id, deleted_ts)
-        else:
-            logger.warning("Received deletion event but could not find deleted_ts")
+        deleted_ts = event.get("deleted_ts") or event.get("previous_message", {}).get("ts")
+        if deleted_ts: delete_message_from_db(channel_id, deleted_ts)
         return
 
-    # 3. Normalize Data (New Message vs Edit)
+    # Normal or Edited Message
     if subtype == "message_changed":
         logger.debug("Processing EDIT event")
         # For edits, the actual text/files are inside the inner 'message' dict
@@ -276,20 +304,19 @@ def handle_message_events(body):
         payload = event
         message_ts = ts
 
-    user_id = payload.get("user")
-    text = payload.get("text")
-    files = payload.get("files", [])
-
-    logger.debug(f"Extracting data -> TS: {message_ts} | User: {user_id} | Text: {text}")
-
-    # 4. Save
-    process_and_save_message(channel_id, message_ts, user_id, text, files)
+    process_and_save_message(channel_id, message_ts, payload.get("user"), payload.get("text"), payload.get("files", []))
 
 # --- 6. ENTRY POINT ---
 if __name__ == "__main__":
-    init_db()
+    # 1. Update Schema
+    migrate_db_schema()
+    
+    # 2. Backfill existing rows with regex data
+    backfill_data()
+    
+    # 3. Sync recent history from Slack
     sync_missing_data()
     
-    # Start the Socket Mode Handler
+    # 4. Start Listener
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
